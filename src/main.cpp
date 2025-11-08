@@ -1,23 +1,32 @@
 /*
  * Rotary Dial Test Program
  * 
- * Simple test sketch to verify rotary dial wiring and operation.
- * Uses the same GPIO pins as the RetroBell project.
+ * Reliable test sketch to verify rotary dial wiring and operation.
+ * Uses proven pulse detection methods and shunt switch completion.
  * 
  * GPIO Configuration:
- * - GPIO 15: ROTARY_PULSE (pulse switch)
- * - GPIO 14: ROTARY_ACTIVE (shunt/off-normal switch)
+ * - GPIO 15: ROTARY_PULSE (pulse switch - counts dial pulses)
+ * - GPIO 14: ROTARY_SHUNT (off-normal switch - detects dialing state)
+ * 
+ * Features:
+ * - Counts pulses on HIGH transitions for reliability
+ * - Uses shunt switch for immediate completion detection
+ * - Proper debouncing (20ms pulse, 50ms shunt)
+ * - Safety timeout backup (3 seconds)
+ * - Works with both 3-wire and 4-wire rotary dials
  * 
  * How to use:
- * 1. Connect your rotary dial according to the wiring diagram
- * 2. Upload this sketch
+ * 1. Connect your rotary dial according to the wiring diagram in README.md
+ * 2. Upload this sketch to your ESP32
  * 3. Open Serial Monitor at 115200 baud
  * 4. Dial digits and watch the output
  * 
  * Expected behavior:
- * - Dial "1" → prints "Digit: 1" (1 pulse)
- * - Dial "5" → prints "Digit: 5" (5 pulses)
- * - Dial "0" → prints "Digit: 0" (10 pulses)
+ * - Dial "1" → "✓ Digit dialed: 1 (1 pulses)"
+ * - Dial "5" → "✓ Digit dialed: 5 (5 pulses)"
+ * - Dial "0" → "✓ Digit dialed: 0 (10 pulses)"
+ * 
+ * Results appear immediately when dial returns to rest position.
  */
 
 #include <Arduino.h>
@@ -26,31 +35,43 @@
 #define ROTARY_PULSE_PIN 15   // Pulse switch (counts rotations)
 #define ROTARY_SHUNT_PIN 14   // Shunt/off-normal switch (active while dialing)
 
-// Dial detection variables
+// Dial detection variables (simplified like working sketch)
 volatile int pulseCount = 0;
 volatile bool dialing = false;
 volatile unsigned long lastPulseTime = 0;
-volatile unsigned long dialStartTime = 0;
+volatile unsigned long dialingTimeout = 0;
 
-// Timing constants
-#define PULSE_TIMEOUT_MS 100      // Time between pulses
-#define DIAL_COMPLETE_TIMEOUT_MS 200  // Time after last pulse to consider digit complete
-#define DEBOUNCE_MS 10            // Debounce time for switches
+// State tracking
+volatile bool lastDialState = HIGH;
+volatile bool lastPulseState = HIGH;
 
-// Interrupt Service Routines
+// Timing constants (based on working Arduino sketch)
+#define PULSE_DEBOUNCE_MS 20         // Debounce time for pulse switch
+#define DIAL_DEBOUNCE_MS 50          // Debounce time for dial switch  
+#define DIAL_TIMEOUT_MS 1500         // Time after last pulse to consider dialing complete
+
+// Interrupt Service Routines (simplified approach like working sketch)
 void IRAM_ATTR onPulse() {
   unsigned long now = millis();
   
-  // Debounce: ignore pulses that come too quickly
-  if (now - lastPulseTime < DEBOUNCE_MS) {
+  // Debounce
+  static unsigned long lastPulseDebounce = 0;
+  if (now - lastPulseDebounce < PULSE_DEBOUNCE_MS) {
     return;
   }
   
-  // Only count pulses when we're actively dialing
-  if (dialing && digitalRead(ROTARY_PULSE_PIN) == LOW) {
-    pulseCount++;
-    lastPulseTime = now;
-    Serial.print(".");  // Visual feedback for each pulse
+  bool currentPulseState = digitalRead(ROTARY_PULSE_PIN);
+  if (currentPulseState != lastPulseState) {
+    lastPulseDebounce = now;
+    
+    // Count on HIGH transitions (like working Arduino sketch)
+    if (dialing && currentPulseState == HIGH) {
+      pulseCount++;
+      lastPulseTime = now;
+      dialingTimeout = now;  // Reset timeout on each pulse
+    }
+    
+    lastPulseState = currentPulseState;
   }
 }
 
@@ -58,23 +79,43 @@ void IRAM_ATTR onShuntChange() {
   unsigned long now = millis();
   
   // Debounce
-  static unsigned long lastShuntChange = 0;
-  if (now - lastShuntChange < DEBOUNCE_MS) {
+  static unsigned long lastDialDebounce = 0;
+  if (now - lastDialDebounce < DIAL_DEBOUNCE_MS) {
     return;
   }
-  lastShuntChange = now;
   
-  // Check if dial is being turned (shunt opens)
-  if (digitalRead(ROTARY_SHUNT_PIN) == HIGH) {
-    // Dial started turning
-    dialing = true;
-    pulseCount = 0;
-    dialStartTime = now;
-    Serial.println("\n[Dial started turning]");
-  } else {
-    // Dial returned to rest (shunt closes)
-    // Don't immediately end dialing - wait for timeout
-    Serial.println("\n[Dial returned to rest]");
+  bool currentDialState = digitalRead(ROTARY_SHUNT_PIN);
+  if (currentDialState != lastDialState) {
+    lastDialDebounce = now;
+    
+    // Start dialing when shunt goes LOW
+    if (!dialing && currentDialState == LOW) {
+      dialing = true;
+      pulseCount = 0;
+      dialingTimeout = now;
+      Serial.println("\n[Dial started turning]");
+    }
+    // End dialing when shunt goes HIGH (dial returned to rest)
+    else if (dialing && currentDialState == HIGH) {
+      dialing = false;
+      Serial.println("\n[Dial returned to rest]");
+      
+      // Process the digit immediately when dial returns to rest
+      if (pulseCount > 0) {
+        // Convert pulse count to digit (10 pulses = 0)
+        int digit = (pulseCount == 10) ? 0 : pulseCount;
+        
+        Serial.println();
+        Serial.print("✓ Digit dialed: ");
+        Serial.print(digit);
+        Serial.print(" (");
+        Serial.print(pulseCount);
+        Serial.println(" pulses)");
+        Serial.println();
+      }
+    }
+    
+    lastDialState = currentDialState;
   }
 }
 
@@ -98,9 +139,17 @@ void setup() {
   pinMode(ROTARY_PULSE_PIN, INPUT_PULLUP);
   pinMode(ROTARY_SHUNT_PIN, INPUT_PULLUP);
   
-  // Attach interrupts
-  attachInterrupt(digitalPinToInterrupt(ROTARY_PULSE_PIN), onPulse, FALLING);
+  // Attach interrupts - try CHANGE to catch both edges
+  attachInterrupt(digitalPinToInterrupt(ROTARY_PULSE_PIN), onPulse, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ROTARY_SHUNT_PIN), onShuntChange, CHANGE);
+  
+  // Show initial switch states for debugging
+  Serial.println("Initial switch states:");
+  Serial.print("  Pulse switch (GPIO 15): ");
+  Serial.println(digitalRead(ROTARY_PULSE_PIN) ? "HIGH" : "LOW");
+  Serial.print("  Shunt switch (GPIO 14): ");
+  Serial.println(digitalRead(ROTARY_SHUNT_PIN) ? "HIGH" : "LOW");
+  Serial.println();
   
   Serial.println("Ready! Start dialing...\n");
 }
@@ -108,10 +157,29 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   
-  // Check if we've finished dialing a digit
-  if (dialing && pulseCount > 0) {
-    // If enough time has passed since the last pulse, consider the digit complete
-    if (now - lastPulseTime > DIAL_COMPLETE_TIMEOUT_MS) {
+  // Handle pulse display (show dots for visual feedback)
+  static int lastDisplayedCount = 0;
+  if (dialing && pulseCount > lastDisplayedCount) {
+    Serial.print(".");
+    Serial.print("[");
+    Serial.print(pulseCount);
+    Serial.print("]");
+    lastDisplayedCount = pulseCount;
+  }
+  
+  // Reset display counter when not dialing
+  if (!dialing) {
+    lastDisplayedCount = 0;
+  }
+  
+  // Keep timeout as safety backup (in case shunt switch fails)
+  if (dialing && (now - dialingTimeout) > (DIAL_TIMEOUT_MS * 2)) {  // 3 seconds as backup
+    // Safety timeout reached - something went wrong
+    dialing = false;
+    
+    Serial.println("\n[Safety timeout - dial may be stuck]");
+    
+    if (pulseCount > 0) {
       // Convert pulse count to digit (10 pulses = 0)
       int digit = (pulseCount == 10) ? 0 : pulseCount;
       
@@ -122,19 +190,6 @@ void loop() {
       Serial.print(pulseCount);
       Serial.println(" pulses)");
       Serial.println();
-      
-      // Reset for next digit
-      pulseCount = 0;
-      dialing = false;
-    }
-  }
-  
-  // Timeout if dial was started but no pulses came
-  if (dialing && pulseCount == 0) {
-    if (now - dialStartTime > 2000) {
-      Serial.println("[Timeout - no pulses detected]");
-      Serial.println();
-      dialing = false;
     }
   }
   
